@@ -1,0 +1,14 @@
+{
+    "name": "naby610/procedures-cli",
+    "description": "Gere tes procedures stockees MySQL comme des migrations : vendor/bin/procedures status | run | make.",
+    "type": "library",
+    "license": "MIT",
+    "bin": [
+        "bin/procedures"
+    ],
+    "require": {
+        "php": "^8.0",
+        "ext-pdo": "*",
+        "ext-pdo_mysql": "*"
+    }
+}
