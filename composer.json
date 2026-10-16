@@ -1,5 +1,5 @@
 {
-    "name": "naby61063/procedures-cli",
+    "name": "naby224610/procedures-cli",
     "description": "Gere tes procedures stockees MySQL comme des migrations : vendor/bin/procedures status | run | make.",
     "type": "library",
     "license": "MIT",
