@@ -408,9 +408,13 @@ function cmdRun(array $c, bool $createDb, bool $force): int
 
     foreach ($todo as $r) {
         try {
-            $p = runFile($pdo, $r);
-            echo "  [OK]  {$p['type']} {$p['name']}  ({$r['key']})\n";
-            $ok++;
+            $procedures = runFile($pdo, $r);
+            $names = implode(', ', array_map(
+                fn ($p) => $p['type'] . ' ' . $p['name'],
+                $procedures
+            ));
+            echo "  [OK]  {$names}  ({$r['key']})\n";
+            $ok += count($procedures);
         } catch (Throwable $e) {
             echo "  [ERR] {$r['key']} : {$e->getMessage()}\n";
             $fail++;
@@ -552,48 +556,76 @@ function parseSql(string $sql): array
 {
     $sql = preg_replace('/^\xEF\xBB\xBF/', '', $sql); // BOM
 
-    // 1) Retirer les lignes DELIMITER (commande du client mysql, pas du SQL)
-    preg_match_all('/^[ \t]*DELIMITER[ \t]+(\S+)[ \t]*$/mi', $sql, $m);
-    $delimiters = array_unique(array_filter($m[1], fn ($d) => $d !== ';'));
+    // Recuperer les delimiters personnalises puis retirer leurs lignes.
+    preg_match_all('/^[ \t]*DELIMITER[ \t]+(\S+)[ \t]*$/mi', $sql, $delimiterMatches);
+    $delimiters = array_values(array_unique(array_filter(
+        $delimiterMatches[1] ?? [],
+        fn ($delimiter) => $delimiter !== ';'
+    )));
     $sql = preg_replace('/^[ \t]*DELIMITER[ \t]+\S+[ \t]*$/mi', '', $sql);
 
-    foreach ($delimiters as $d) {
-        $sql = preg_replace('/' . preg_quote($d, '/') . '[ \t]*$/m', '', $sql);
-    }
+    // Les DROP sont geres automatiquement avant chaque CREATE.
+    $sql = preg_replace(
+        '/^[ \t]*DROP\s+(?:PROCEDURE|FUNCTION)\s+(?:IF\s+EXISTS\s+)?[^;\r\n]+;?[ \t]*$/mi',
+        '',
+        $sql
+    );
 
-    // 2) Retirer les DROP PROCEDURE/FUNCTION (ajoutes automatiquement ensuite)
-    $sql = preg_replace('/^[ \t]*DROP\s+(?:PROCEDURE|FUNCTION)\s+(?:IF\s+EXISTS\s+)?[^;]+;/mi', '', $sql);
-
-    // 3) Trouver le nom
+    // Reperer le debut de chaque procedure/fonction.
     $pattern = '/CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(PROCEDURE|FUNCTION)\s+(?:IF\s+NOT\s+EXISTS\s+)?'
         . '((?:`[^`]+`|[\w$]+)(?:\.(?:`[^`]+`|[\w$]+))?)/i';
 
-    $count = preg_match_all($pattern, $sql, $matches);
+    $count = preg_match_all($pattern, $sql, $matches, PREG_OFFSET_CAPTURE);
 
-    if ($count === 0) {
+    if ($count === false || $count === 0) {
         throw new RuntimeException('Aucun CREATE PROCEDURE / CREATE FUNCTION trouve.');
     }
 
-    if ($count > 1) {
-        throw new RuntimeException('Plusieurs procedures dans ce fichier : mets une seule procedure par fichier.');
+    $procedures = [];
+
+    for ($i = 0; $i < $count; $i++) {
+        $start = $matches[0][$i][1];
+        $end = ($i + 1 < $count) ? $matches[0][$i + 1][1] : strlen($sql);
+        $statement = trim(substr($sql, $start, $end - $start));
+
+        // Retirer le delimiter de fin (par exemple $$ ou //) sans toucher
+        // aux points-virgules internes du corps SQL.
+        foreach ($delimiters as $delimiter) {
+            $statement = preg_replace(
+                '/' . preg_quote($delimiter, '/') . '\s*$/',
+                '',
+                $statement
+            );
+        }
+
+        $statement = rtrim(trim($statement), "; \t\n\r");
+
+        $procedures[] = [
+            'type'   => strtoupper($matches[1][$i][0]),
+            'name'   => $matches[2][$i][0],
+            'create' => $statement,
+        ];
     }
 
-    return [
-        'type'   => strtoupper($matches[1][0]),
-        'name'   => $matches[2][0],
-        'create' => rtrim(trim($sql), "; \t\n\r"),
-    ];
+    return $procedures;
 }
 
 function runFile(PDO $pdo, array $row): array
 {
-    $p = parseSql($row['contents']);
+    $procedures = parseSql($row['contents']);
+    $names = [];
 
-    $pdo->exec("DROP {$p['type']} IF EXISTS {$p['name']}");
-    $pdo->exec($p['create']);
+    foreach ($procedures as $procedure) {
+        $pdo->exec("DROP {$procedure['type']} IF EXISTS {$procedure['name']}");
+        $pdo->exec($procedure['create']);
+        $names[] = $procedure['name'];
+    }
 
-    $st = $pdo->prepare('REPLACE INTO sql_procedures (file, name, checksum, executed_at) VALUES (?, ?, ?, NOW())');
-    $st->execute([$row['key'], $p['name'], $row['sum']]);
+    // Un seul suivi par fichier, meme s'il contient plusieurs procedures.
+    $st = $pdo->prepare(
+        'REPLACE INTO sql_procedures (file, name, checksum, executed_at) VALUES (?, ?, ?, NOW())'
+    );
+    $st->execute([$row['key'], implode(', ', $names), $row['sum']]);
 
-    return $p;
+    return $procedures;
 }
