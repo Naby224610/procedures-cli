@@ -5,14 +5,22 @@
  * Gestionnaire de procedures stockees MySQL (sans Laravel).
  * A lancer depuis la racine de ton projet :
  *
+ *   vendor/bin/procedures where         montre le dossier des procedures detecte
  *   vendor/bin/procedures createdb      cree la base (nom lu dans .env : DB_DATABASE)
- *   vendor/bin/procedures make nom      cree un fichier de procedure dans database/procedures
+ *   vendor/bin/procedures make nom      cree un fichier de procedure dans le dossier detecte
  *   vendor/bin/procedures status        montre ce qui est execute / en attente
  *   vendor/bin/procedures run           execute seulement ce qui n'est pas execute
  *   vendor/bin/procedures query "SQL"   lance une requete (ex: CALL ma_proc())
  *
  * Reglages lus dans le fichier .env du projet :
  *   DB_HOST  DB_PORT  DB_USERNAME  DB_PASSWORD  DB_DATABASE  PROCEDURES_PATH
+ *
+ * Dossier des procedures, par ordre de priorite :
+ *   1. --path=dossier
+ *   2. PROCEDURES_PATH dans .env
+ *   3. detection automatique (dossier du projet qui contient des fichiers .sql avec CREATE PROCEDURE)
+ *   4. un dossier habituel deja existant (database/procedures, sql/procedures, ...)
+ *   5. database/procedures (cree par "make")
  *
  * Options : --database= --host= --port= --user= --password= --path=
  *           --force (run : tout re-executer)  --create-db (run : cree la base si besoin)
@@ -21,6 +29,9 @@
 if (PHP_SAPI !== 'cli') {
     exit('Ce script se lance dans le terminal.');
 }
+
+// Un fichier contient une procedure ou une fonction s'il a un CREATE PROCEDURE / CREATE FUNCTION.
+define('PROC_REGEX', '/CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION)\s/i');
 
 $root = getcwd();
 $env = loadEnv($root . '/.env');
@@ -31,7 +42,6 @@ $config = [
     'username' => envValue($env, 'DB_USERNAME', 'root'),
     'password' => envValue($env, 'DB_PASSWORD', ''),
     'database' => envValue($env, 'PROCEDURES_DB_DATABASE', envValue($env, 'DB_DATABASE', '')),
-    'path'     => envValue($env, 'PROCEDURES_PATH', 'database/procedures'),
 ];
 
 $args = array_slice($argv, 1);
@@ -48,17 +58,21 @@ foreach (array_slice($args, 1) as $arg) {
     }
 }
 
-$map = ['host' => 'host', 'port' => 'port', 'user' => 'username', 'password' => 'password', 'database' => 'database', 'path' => 'path'];
+$map = ['host' => 'host', 'port' => 'port', 'user' => 'username', 'password' => 'password', 'database' => 'database'];
 foreach ($map as $opt => $key) {
     if (isset($options[$opt]) && $options[$opt] !== true) {
         $config[$key] = $options[$opt];
     }
 }
 
-$config['path'] = isAbsolute($config['path']) ? $config['path'] : $root . '/' . $config['path'];
-
 try {
+    if (in_array($command, ['where', 'make', 'status', 'run'], true)) {
+        $config = resolveFolder($config, $root, $env, $options);
+    }
+
     switch ($command) {
+        case 'where':
+            exit(cmdWhere($config));
         case 'createdb':
             exit(cmdCreateDb($config));
         case 'make':
@@ -131,20 +145,153 @@ function isAbsolute(string $path): bool
 }
 
 /* ------------------------------------------------------------------ */
+/* Detection du dossier des procedures                                 */
+/* ------------------------------------------------------------------ */
+
+function resolveFolder(array $c, string $root, array $env, array $options): array
+{
+    $explicit = (isset($options['path']) && $options['path'] !== true) ? $options['path'] : null;
+    $fromEnv = envValue($env, 'PROCEDURES_PATH', '');
+    $others = [];
+
+    if ($explicit !== null) {
+        $path = $explicit;
+        $source = 'option --path';
+    } elseif ($fromEnv !== '') {
+        $path = $fromEnv;
+        $source = 'PROCEDURES_PATH du .env';
+    } else {
+        $found = detectFolders($root);
+
+        if ($found) {
+            $keys = array_keys($found);
+            $path = $keys[0];
+            $others = array_slice($keys, 1);
+            $source = 'detecte automatiquement';
+        } else {
+            $path = 'database/procedures';
+            $source = 'par defaut, sera cree par make';
+
+            $candidates = ['database/procedures', 'database/sql/procedures', 'database/routines',
+                'database/stored_procedures', 'sql/procedures', 'db/procedures', 'procedures'];
+
+            foreach ($candidates as $candidate) {
+                if (is_dir($root . '/' . $candidate)) {
+                    $path = $candidate;
+                    $source = 'dossier existant';
+                    break;
+                }
+            }
+        }
+    }
+
+    $c['root'] = $root;
+    $c['path'] = isAbsolute($path) ? $path : $root . '/' . $path;
+    $c['path_source'] = $source;
+    $c['others'] = $others;
+
+    return $c;
+}
+
+/**
+ * Cherche dans le projet les dossiers qui contiennent des fichiers .sql avec
+ * CREATE PROCEDURE / CREATE FUNCTION. Retourne [dossier => nombre de fichiers],
+ * le dossier qui en contient le plus en premier.
+ */
+function detectFolders(string $root): array
+{
+    $skip = ['vendor', 'node_modules', 'storage', 'bootstrap', 'public', 'tests', 'dist', 'build', 'cache'];
+    $counts = [];
+
+    try {
+        $dirs = new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS);
+
+        $filter = new RecursiveCallbackFilterIterator($dirs, function ($current, $key, $iterator) use ($skip) {
+            $name = $current->getFilename();
+
+            if ($iterator->hasChildren()) {
+                return $name[0] !== '.' && !in_array(strtolower($name), $skip, true);
+            }
+
+            return strtolower($current->getExtension()) === 'sql';
+        });
+
+        $it = new RecursiveIteratorIterator($filter);
+        $it->setMaxDepth(8);
+
+        foreach ($it as $file) {
+            if ($file->getSize() > 2097152) { // on ignore les fichiers > 2 Mo (sauvegardes)
+                continue;
+            }
+
+            $content = @file_get_contents($file->getPathname());
+
+            if ($content === false || !preg_match(PROC_REGEX, $content)) {
+                continue;
+            }
+
+            $dir = str_replace('\\', '/', $file->getPath());
+            $counts[$dir] = ($counts[$dir] ?? 0) + 1;
+        }
+    } catch (Throwable $e) {
+        // dossier illisible : on garde ce qui a ete trouve
+    }
+
+    uksort($counts, fn ($a, $b) => $counts[$b] <=> $counts[$a] ?: strlen($a) <=> strlen($b));
+
+    return $counts;
+}
+
+function relPath(array $c, string $path): string
+{
+    $root = rtrim(str_replace('\\', '/', $c['root']), '/') . '/';
+    $p = str_replace('\\', '/', $path);
+
+    return strncasecmp($p, $root, strlen($root)) === 0 ? substr($p, strlen($root)) : $p;
+}
+
+function showFolder(array $c): void
+{
+    echo 'Dossier : ' . relPath($c, $c['path']) . '  (' . $c['path_source'] . ")\n";
+
+    if (!empty($c['others'])) {
+        echo "Attention : d'autres dossiers contiennent aussi des procedures :\n";
+        foreach ($c['others'] as $other) {
+            echo '  - ' . relPath($c, $other) . "\n";
+        }
+        echo "Pour en utiliser un autre : PROCEDURES_PATH=dossier dans .env, ou --path=dossier\n";
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Commandes                                                           */
 /* ------------------------------------------------------------------ */
 
 function cmdHelp(): int
 {
     echo "Commandes (a lancer depuis la racine de ton projet) :\n";
+    echo "  vendor/bin/procedures where          Montre le dossier des procedures detecte\n";
     echo "  vendor/bin/procedures createdb       Cree la base de donnees (DB_DATABASE du .env)\n";
-    echo "  vendor/bin/procedures make nom       Cree un fichier de procedure dans database/procedures\n";
+    echo "  vendor/bin/procedures make nom       Cree un fichier de procedure dans le dossier detecte\n";
     echo "  vendor/bin/procedures status         Montre les procedures executees / en attente\n";
     echo "  vendor/bin/procedures run            Execute celles qui sont en attente ou modifiees\n";
     echo "  vendor/bin/procedures query \"SQL\"    Lance une requete, ex : \"CALL say_hello()\"\n";
     echo "\nReglages lus dans .env : DB_HOST DB_PORT DB_USERNAME DB_PASSWORD DB_DATABASE PROCEDURES_PATH\n";
     echo "Options : --database=nom --host= --port= --user= --password= --path=\n";
     echo "          --force (run : tout re-executer)   --create-db (run : cree la base si besoin)\n";
+    return 0;
+}
+
+function cmdWhere(array $c): int
+{
+    showFolder($c);
+
+    if (is_dir($c['path'])) {
+        echo count(listFiles($c['path'])) . " fichier(s) .sql dans ce dossier.\n";
+    } else {
+        echo "Ce dossier n'existe pas encore : il sera cree par vendor/bin/procedures make nom_procedure\n";
+    }
+
     return 0;
 }
 
@@ -163,11 +310,21 @@ function cmdMake(array $c, ?string $name): int
 
     $name = strtolower(trim(preg_replace('/[^A-Za-z0-9]+/', '_', $name), '_'));
 
+    $existing = is_dir($c['path']) ? listFiles($c['path']) : [];
+
+    // On suit ta convention : prefixe date seulement si tes fichiers existants en ont un.
+    $numbered = !$existing || array_filter($existing, fn ($f) => preg_match('/^\d+_/', basename($f)));
+
     if (!is_dir($c['path'])) {
         mkdir($c['path'], 0777, true);
     }
 
-    $file = rtrim($c['path'], '/\\') . '/' . date('Y_m_d_His') . "_{$name}.sql";
+    $dir = rtrim(str_replace('\\', '/', $c['path']), '/');
+    $file = $dir . '/' . ($numbered ? date('Y_m_d_His') . "_{$name}" : $name) . '.sql';
+
+    if (file_exists($file)) {
+        throw new RuntimeException('Le fichier existe deja : ' . relPath($c, $file));
+    }
 
     $stub = <<<'SQL'
 -- Procedure : {name}
@@ -180,7 +337,9 @@ DELIMITER ;
 SQL;
 
     file_put_contents($file, str_replace('{name}', $name, $stub) . PHP_EOL);
-    echo "Fichier cree : {$file}\n";
+
+    showFolder($c);
+    echo 'Fichier cree : ' . relPath($c, $file) . "\n";
     return 0;
 }
 
@@ -188,10 +347,12 @@ function cmdStatus(array $c): int
 {
     $pdo = connect($c, false);
     ensureTable($pdo);
-    $rows = getStatus($pdo, listFiles($c['path']));
+    $rows = getStatus($pdo, listFiles($c['path']), $c['path']);
+
+    showFolder($c);
 
     if (!$rows) {
-        echo "Aucun fichier .sql trouve dans : {$c['path']}\n";
+        echo "Aucun fichier .sql trouve dans ce dossier.\n";
         return 0;
     }
 
@@ -225,10 +386,12 @@ function cmdRun(array $c, bool $createDb, bool $force): int
 {
     $pdo = connect($c, $createDb);
     ensureTable($pdo);
-    $rows = getStatus($pdo, listFiles($c['path']));
+    $rows = getStatus($pdo, listFiles($c['path']), $c['path']);
+
+    showFolder($c);
 
     if (!$rows) {
-        echo "Aucun fichier .sql trouve dans : {$c['path']}\n";
+        echo "Aucun fichier .sql trouve dans ce dossier.\n";
         return 0;
     }
 
@@ -341,25 +504,39 @@ function ensureTable(PDO $pdo): void
 /* Fichiers et procedures                                              */
 /* ------------------------------------------------------------------ */
 
+/** Tous les fichiers .sql du dossier, sous-dossiers compris. */
 function listFiles(string $path): array
 {
     if (!is_dir($path)) {
-        throw new RuntimeException("Dossier introuvable : {$path}\nCree-le avec : vendor/bin/procedures make nom_procedure");
+        throw new RuntimeException(
+            "Aucun dossier de procedures trouve.\n"
+            . "Cree ta premiere procedure avec : vendor/bin/procedures make nom_procedure\n"
+            . 'Ou indique ton dossier avec PROCEDURES_PATH dans .env, ou --path=dossier'
+        );
     }
 
-    $files = glob(rtrim($path, '/\\') . '/*.sql') ?: [];
+    $files = [];
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS));
+
+    foreach ($it as $f) {
+        if ($f->isFile() && strtolower($f->getExtension()) === 'sql') {
+            $files[] = str_replace('\\', '/', $f->getPathname());
+        }
+    }
+
     natcasesort($files);
 
     return array_values($files);
 }
 
-function getStatus(PDO $pdo, array $files): array
+function getStatus(PDO $pdo, array $files, string $base): array
 {
+    $base = rtrim(str_replace('\\', '/', $base), '/');
     $records = $pdo->query('SELECT file, checksum FROM sql_procedures')->fetchAll(PDO::FETCH_KEY_PAIR);
     $rows = [];
 
     foreach ($files as $file) {
-        $key = basename($file);
+        $key = strncmp($file, $base . '/', strlen($base) + 1) === 0 ? substr($file, strlen($base) + 1) : basename($file);
         $contents = file_get_contents($file);
         $sum = hash('sha256', $contents);
 
@@ -398,7 +575,7 @@ function parseSql(string $sql): array
     }
 
     if ($count > 1) {
-        throw new RuntimeException('Un seul CREATE PROCEDURE/FUNCTION par fichier est autorise.');
+        throw new RuntimeException('Plusieurs procedures dans ce fichier : mets une seule procedure par fichier.');
     }
 
     return [
