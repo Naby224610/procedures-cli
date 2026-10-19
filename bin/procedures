@@ -356,7 +356,7 @@ function cmdStatus(array $c): int
         return 0;
     }
 
-    $labels = ['done' => 'Executee', 'pending' => 'En attente', 'modified' => 'Modifiee (a re-executer)'];
+    $labels = ['done' => 'Executee', 'pending' => 'En attente', 'modified' => 'Modifiee (a re-executer)', 'unreadable' => 'ILLISIBLE'];
     $width = max(array_map(fn ($r) => strlen($r['key']), $rows));
     $width = max($width, 7);
 
@@ -407,8 +407,18 @@ function cmdRun(array $c, bool $createDb, bool $force): int
     $fail = 0;
 
     foreach ($todo as $r) {
+        if ($r['state'] === 'unreadable') {
+            echo "  [ERR] {$r['key']} : fichier SQL illisible (verifie les permissions Windows).\n";
+            $fail++;
+            continue;
+        }
+
         try {
             $procedures = runFile($pdo, $r);
+            if (!$procedures) {
+                echo "  [SKIP] {$r['key']} : aucune procedure/fonction trouvee; fichier ignore.\n";
+                continue;
+            }
             $names = implode(', ', array_map(
                 fn ($p) => $p['type'] . ' ' . $p['name'],
                 $procedures
@@ -498,10 +508,16 @@ function ensureTable(PDO $pdo): void
     $pdo->exec('CREATE TABLE IF NOT EXISTS sql_procedures (
         id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         file VARCHAR(255) NOT NULL UNIQUE,
-        name VARCHAR(255) NOT NULL,
+        name TEXT NOT NULL,
         checksum CHAR(64) NOT NULL,
         executed_at DATETIME NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+
+    // Met a niveau les anciennes installations ou name etait limite a VARCHAR(255).
+    $column = $pdo->query("SHOW COLUMNS FROM sql_procedures LIKE 'name'")->fetch(PDO::FETCH_ASSOC);
+    if ($column && stripos((string) $column['Type'], 'text') !== 0) {
+        $pdo->exec('ALTER TABLE sql_procedures MODIFY name TEXT NOT NULL');
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -541,91 +557,129 @@ function getStatus(PDO $pdo, array $files, string $base): array
 
     foreach ($files as $file) {
         $key = strncmp($file, $base . '/', strlen($base) + 1) === 0 ? substr($file, strlen($base) + 1) : basename($file);
-        $contents = file_get_contents($file);
+        $contents = @file_get_contents($file);
+        if ($contents === false) {
+            $rows[] = ['key' => $key, 'path' => $file, 'contents' => '', 'sum' => '', 'state' => 'unreadable'];
+            continue;
+        }
         $sum = hash('sha256', $contents);
-
         $state = !isset($records[$key]) ? 'pending' : ($records[$key] === $sum ? 'done' : 'modified');
-
         $rows[] = ['key' => $key, 'path' => $file, 'contents' => $contents, 'sum' => $sum, 'state' => $state];
     }
 
     return $rows;
 }
 
+
 function parseSql(string $sql): array
 {
-    $sql = preg_replace('/^\xEF\xBB\xBF/', '', $sql); // BOM
+    // Supprimer le BOM UTF-8 éventuel.
+    $sql = preg_replace('/^\xEF\xBB\xBF/', '', $sql);
 
-    // Recuperer les delimiters personnalises puis retirer leurs lignes.
-    preg_match_all('/^[ \t]*DELIMITER[ \t]+(\S+)[ \t]*$/mi', $sql, $delimiterMatches);
-    $delimiters = array_values(array_unique(array_filter(
-        $delimiterMatches[1] ?? [],
-        fn ($delimiter) => $delimiter !== ';'
-    )));
-    $sql = preg_replace('/^[ \t]*DELIMITER[ \t]+\S+[ \t]*$/mi', '', $sql);
+    $lines = preg_split('/\r\n|\n|\r/', $sql);
 
-    // Les DROP sont geres automatiquement avant chaque CREATE.
-    $sql = preg_replace(
-        '/^[ \t]*DROP\s+(?:PROCEDURE|FUNCTION)\s+(?:IF\s+EXISTS\s+)?[^;\r\n]+;?[ \t]*$/mi',
-        '',
-        $sql
-    );
-
-    // Reperer le debut de chaque procedure/fonction.
-    $pattern = '/CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(PROCEDURE|FUNCTION)\s+(?:IF\s+NOT\s+EXISTS\s+)?'
-        . '((?:`[^`]+`|[\w$]+)(?:\.(?:`[^`]+`|[\w$]+))?)/i';
-
-    $count = preg_match_all($pattern, $sql, $matches, PREG_OFFSET_CAPTURE);
-
-    if ($count === false || $count === 0) {
-        throw new RuntimeException('Aucun CREATE PROCEDURE / CREATE FUNCTION trouve.');
-    }
-
+    $delimiter = ';';
+    $buffer = '';
     $procedures = [];
 
-    for ($i = 0; $i < $count; $i++) {
-        $start = $matches[0][$i][1];
-        $end = ($i + 1 < $count) ? $matches[0][$i + 1][1] : strlen($sql);
-        $statement = trim(substr($sql, $start, $end - $start));
+    /*
+     * Analyse une instruction SQL terminée.
+     * Seules les instructions CREATE PROCEDURE/FUNCTION sont conservées.
+     */
+    $addStatement = static function (string $statement) use (&$procedures): void {
+        $statement = trim($statement);
 
-        // Retirer le delimiter de fin (par exemple $$ ou //) sans toucher
-        // aux points-virgules internes du corps SQL.
-        foreach ($delimiters as $delimiter) {
-            $statement = preg_replace(
-                '/' . preg_quote($delimiter, '/') . '\s*$/',
-                '',
-                $statement
-            );
+        if ($statement === '') {
+            return;
         }
 
-        $statement = rtrim(trim($statement), "; \t\n\r");
+        $pattern = '/CREATE\s+(?:OR\s+REPLACE\s+)?'
+            . '(?:DEFINER\s*=\s*(?:`[^`]+`@`[^`]+`|[^\s]+)\s+)?'
+            . '(PROCEDURE|FUNCTION)\s+'
+            . '(?:IF\s+NOT\s+EXISTS\s+)?'
+            . '((?:`[^`]+`|[\w$]+)(?:\.(?:`[^`]+`|[\w$]+))?)/i';
+
+        if (!preg_match($pattern, $statement, $matches, PREG_OFFSET_CAPTURE)) {
+            // Ignore notamment DROP, SET et les instructions isolées.
+            return;
+        }
+
+        $type = strtoupper($matches[1][0]);
+        $name = $matches[2][0];
+
+        // Garder l'instruction à partir de CREATE, sans commentaire préalable.
+        $create = trim(substr($statement, $matches[0][1]));
+
+        // Nettoyer un éventuel délimiteur résiduel en fin d'instruction.
+        $create = preg_replace('/(?:\$\$|\/\/|;)\s*$/', '', $create);
+        $create = rtrim(trim($create), "; \t\n\r");
+
+        if ($create === '') {
+            return;
+        }
 
         $procedures[] = [
-            'type'   => strtoupper($matches[1][$i][0]),
-            'name'   => $matches[2][$i][0],
-            'create' => $statement,
+            'type'   => $type,
+            'name'   => $name,
+            'create' => $create,
         ];
+    };
+
+    foreach ($lines as $line) {
+        /*
+         * DELIMITER est une directive du client MySQL, pas une instruction
+         * SQL à transmettre à PDO.
+         */
+        if (
+            preg_match('/^[ \t]*DELIMITER[ \t]+(\S+)[ \t]*(?:--.*)?$/i', $line, $matches)
+            && trim($buffer) === ''
+        ) {
+            $delimiter = $matches[1];
+            continue;
+        }
+
+        $buffer .= $line . "\n";
+
+        /*
+         * Dans les fichiers habituels, le délimiteur de routine est placé
+         * à la fin de la ligne END$$ ou END//.
+         * Les points-virgules internes restent donc dans le corps SQL.
+         */
+        $pattern = '/' . preg_quote($delimiter, '/') . '[ \t]*(?:--[^\r\n]*)?\s*$/s';
+
+        if (preg_match($pattern, $buffer)) {
+            $statement = preg_replace($pattern, '', $buffer, 1);
+            $addStatement($statement);
+            $buffer = '';
+        }
+    }
+
+    // Traiter une dernière instruction qui n'aurait pas de délimiteur final.
+    if (trim($buffer) !== '') {
+        $addStatement($buffer);
     }
 
     return $procedures;
 }
 
+
 function runFile(PDO $pdo, array $row): array
 {
     $procedures = parseSql($row['contents']);
-    $names = [];
-
-    foreach ($procedures as $procedure) {
-        $pdo->exec("DROP {$procedure['type']} IF EXISTS {$procedure['name']}");
-        $pdo->exec($procedure['create']);
-        $names[] = $procedure['name'];
+    if (!$procedures) {
+        return [];
     }
 
-    // Un seul suivi par fichier, meme s'il contient plusieurs procedures.
-    $st = $pdo->prepare(
-        'REPLACE INTO sql_procedures (file, name, checksum, executed_at) VALUES (?, ?, ?, NOW())'
-    );
-    $st->execute([$row['key'], implode(', ', $names), $row['sum']]);
+    $names = [];
+    foreach ($procedures as $procedure) {
+        // MySQL ne propose pas CREATE OR REPLACE pour les routines dans toutes les versions.
+        // Attention : le DROP est irreversible si le CREATE suivant echoue.
+        $pdo->exec("DROP {$procedure['type']} IF EXISTS {$procedure['name']}");
+        $pdo->exec($procedure['create']);
+        $names[] = $procedure['type'] . ' ' . $procedure['name'];
+    }
 
+    $st = $pdo->prepare('REPLACE INTO sql_procedures (file, name, checksum, executed_at) VALUES (?, ?, ?, NOW())');
+    $st->execute([$row['key'], implode(', ', $names), $row['sum']]);
     return $procedures;
 }
