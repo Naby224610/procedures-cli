@@ -632,7 +632,7 @@ function parseSql(string $sql): array
          */
         if (
             preg_match('/^[ \t]*DELIMITER[ \t]+(\S+)[ \t]*(?:--.*)?$/i', $line, $matches)
-            && trim($buffer) === ''
+            && trim(preg_replace('/^[ \t]*--.*$/m', '', $buffer)) === ''
         ) {
             $delimiter = $matches[1];
             continue;
